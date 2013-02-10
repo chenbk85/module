@@ -1,7 +1,7 @@
 ifneq ($(KERNELRELEASE),)
 	obj-m := fable.o
 else
-	KERNELDIR ?= /home/zausiu/sksm/
+	KERNELDIR ?= /usr/src/linux/
 	PWD := $(shell pwd)
 
 default:

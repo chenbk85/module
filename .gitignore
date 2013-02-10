@@ -33,6 +33,8 @@
 #
 # Top-level generic files
 #
+*last
+copy*
 tags
 TAGS
 vmlinux
