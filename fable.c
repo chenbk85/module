@@ -14,6 +14,7 @@
 #include <linux/wait.h>
 #include <linux/swap.h>
 #include <linux/sksm.h>
+#include <linux/pid.h>
 
 MODULE_LICENSE("GPL");
 
@@ -189,7 +190,7 @@ int unregister_vma_sksm(struct vm_area_struct *vma)
 #ifdef CONFIG_SYSFS
 #define SKSM_ATTR_RO(_name) static struct kobj_attribute _name##_attr = __ATTR_RO(_name)
 #define SKSM_ATTR(_name) static struct kobj_attribute _name##_attr = \
-		_ATTR(_name, 0644, _name##_show, _name##_store)
+		__ATTR(_name, 0644, _name##_show, _name##_store)
 
 static ssize_t sth_sksm_show(struct kobject *kobj,
 			     struct kobj_attribute *attr, char *buf)
@@ -198,18 +199,54 @@ static ssize_t sth_sksm_show(struct kobject *kobj,
 }
 SKSM_ATTR_RO(sth_sksm);
 
-static ssize_t get_sth(struct kobject *kobj,
+static ssize_t mytest_show(struct kobject *kobj,
 			struct kobj_attribute *attr, char *buf)
 {
+	int count;
+	struct vm_area_struct *vma;
+	struct mm_struct *mm;
+	struct pid *pid = find_get_pid(the_pid);
+	struct task_struct *task = pid_task(pid, PIDTYPE_PID);
+	put_pid(pid);
+
+	count = 0;
+	if(!task)
+	{
+		count = sprintf(buf, "Failed to get pid %d's task_t.\n",
+			the_pid);
+		return count;
+	}
+	count = sprintf(buf, "Get pid %d's task_t OKAY.\n", the_pid);
+	
+	/*Fix me, Race condition here.*/
+	mm = task->mm;
+	down_read(&mm->mmap_sem);
+	vma = mm->mmap;
+	while(vma)
+	{
+		if(is_mergeable_area(vma))
+			count += sprintf(buf+count, "%lx %lx\n", vma->vm_start,
+				vma->vm_end);
+		vma = vma->vm_next;
+	}
+	up_read(&mm->mmap_sem);
+
+	return count;
 }
-static ssize_t put_sth(struct kobject *kobj,
+static ssize_t mytest_store(struct kobject *kobj,
 			struct kobj_attribute *attr, char *buf, size_t count)
 {
+	//char *ptr = buf + count -1;
+	the_pid = simple_strtol(buf, NULL, 10);
+	return count;
+	//buf[count] = 0;
+	//printk(KERN_EMERG"%s ## %d\n", buf, count);
 }
-SKSM_ATTR(put_get);
+SKSM_ATTR(mytest);
 
 static struct attribute *sksm_attrs[] = { 
 	&sth_sksm_attr, 
+	&mytest_attr,
 	NULL 
 };
 static struct attribute_group sksm_attr_group = {
@@ -238,6 +275,8 @@ static int __init sksm_init(void)
 
 static void __exit sksm_exit(void)
 {
+    sysfs_remove_group(mm_kobj, &sksm_attr_group);
+    kmem_cache_destroy(vam_sksm_info_cache);
     printk(KERN_DEBUG "SKSM: Exit.");
 } 
 
