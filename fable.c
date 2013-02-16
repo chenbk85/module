@@ -1,6 +1,7 @@
 #include <linux/errno.h>
 #include <linux/mm_types.h>
 #include <linux/types.h>
+#include <linux/hash.h>
 #include <linux/mm.h>
 #include <linux/fs.h>
 #include <linux/pagemap.h>
@@ -13,273 +14,166 @@
 #include <linux/spinlock.h>
 #include <linux/wait.h>
 #include <linux/swap.h>
-#include <linux/sksm.h>
 #include <linux/pid.h>
 
 MODULE_LICENSE("GPL");
 
-static pid_t the_pid;  // for test ...
-static unsigned int vma_count;	// 记有多少个vma被注册
-static struct kmem_cache *vam_sksm_info_cache;
+#define KSM_KMEM_CACHE(__struct, __flags) kmem_cache_create("ksm_"#__struct, \
+	sizeof(struct __struct), __alignof__(struct __struct), (__flags), NULL);
 
-#define SKSM_KMEM_CACHE(__struct, __flags) kmem_cache_create("SKSM_"#__struct, \
-	sizeof(struct __struct), __alignof__(struct __struct), (__flags), NULL)
-#define VMA_SKSM_INFO_LIST_COUNT 3	// 有多少个存放vma_sksm_info_list的队列.
+static struct kmem_cache *bitmap_cache;
 
-struct rb_root vma_sksm_info_tree = RB_ROOT;	// 红黑树，保存了所有的vma_sksm_info. 
-static spinlock_t vma_sksm_info_lock = SPIN_LOCK_UNLOCKED;
-struct vma_sksm_info {
-    struct vm_area_struct *vma;
-    struct rb_node tree_node;	// all vma_sksm_info data are stored in a red black tree.
-
-    struct list_head level_list;	// vma_sksm_info 被存在哪个级别的list中.
-    // struct rb_node level_node;	// 这个级别的vma_sksm_info也用红黑树存起来. 
+struct bitmap{
+	unsigned char *mem;
+	int length;
 };
-static struct list_head vma_sksm_info_heads[VMA_SKSM_INFO_LIST_COUNT];
-//static struct rb_root vma_sksm_info_trees[VMA_SKSM_INFO_LIST_COUNT];
-//static spinlock_t vma_sksm_info_locks[VMA_SKSM_INFO_LIST_COUNT];
-
-static int init_vma_sksm_infos(void)
+// Every pair of "two-bit" correspond to a page or page frame.
+// size specifies at least how many pairs of 'two-bit' will be allocated.
+struct bitmap *bitmap_create(unsigned int page_count)
 {
-    int i;
-    for (i = 0; i < VMA_SKSM_INFO_LIST_COUNT; i++)
-    {
-	INIT_LIST_HEAD(&vma_sksm_info_heads[i]);
-    }
-
-    return 0;
-};
-
-static inline struct vma_sksm_info *alloc_vma_sksm_info(void)
-{
-    struct vma_sksm_info *vsi;
-
-    vsi = kmem_cache_zalloc(vam_sksm_info_cache, GFP_KERNEL);
-
-    return vsi;
+	struct bitmap *bitmap;
+	int size_in_byte = ( page_count + 3) / 4;
+	unsigned char *mem = kmalloc(size_in_byte, GFP_KERNEL);
+	if (NULL==mem)
+		return NULL;
+	memset(mem, 0, size_in_byte);
+	bitmap = kmem_cache_alloc(bitmap_cache, GFP_KERNEL);
+	if (NULL==bitmap)
+		return NULL;
+	bitmap->mem = mem;
+	bitmap->length = size_in_byte;
+	
+	return bitmap;	
 }
 
-static inline void free_vma_sksm_info(struct vma_sksm_info *vsi)
+void bitmap_destroy(struct bitmap *bitmap)
 {
-    vsi->vma = NULL;
-    kmem_cache_free(vam_sksm_info_cache, vsi);
+	BUG_ON(NULL==bitmap);
+	kfree(bitmap->mem);
+	kmem_cache_free(bitmap_cache, bitmap);
 }
 
-int is_mergeable_area(struct vm_area_struct *vma)
+/**
+ * @index the index number of two-bit pair starting from 0;
+ * @ch only 0,1,2,3 are valid.
+ * This function will return -1 if failed, otherwise return
+ * 0 on success.
+ */
+int bitmap_write(struct bitmap *bm, unsigned index, u8 ch)
 {
-        unsigned long flags = vma->vm_flags;
-        
-        if(vma->vm_file)
-                return 0;
-        
-        if(flags&(VM_SHARED|VM_MAYSHARE|VM_PFNMAP|VM_IO|VM_DONTEXPAND|
-                VM_HUGETLB|VM_NONLINEAR|VM_MIXEDMAP))
-                return 0;
-        
-        return 1;
-}
+	u8 needle;
+	unsigned int pos;
+	pos = ( index*2 + 7 ) / 8;
+printk(KERN_DEBUG"bitmap_write: %d %d\n", index, ch);
+	if (pos >= bm->length) 
+		return -1;
+	needle = index*2 % 8;	
+	ch &= 0x03;
+	ch <<= needle;
+	bm->mem[pos] &= ~(0x3<<needle);
+	bm->mem[pos] |= ch; 
 
-int __register_vma_sksm(struct vm_area_struct *vma)
-{
-        int ret;
-	struct rb_node **new = &vma_sksm_info_tree.rb_node;
-	struct rb_node *parent = NULL;
-	struct vma_sksm_info *vsi;
-
-	spin_lock(&vma_sksm_info_lock);
-	
-	while(*new)
-	{
-		vsi = rb_entry(*new, struct vma_sksm_info, tree_node);
-		parent = *new;
-		if(vma<vsi->vma)
-                {
-                       new = &parent->rb_left; 
-                }
-                else if(vma>vsi->vma)
-                {
-                       new = &parent->rb_right; 
-                }
-                else
-                {
-                        // the vma has already been registered.
-                        ret = 0;
-                        goto _out;
-                }
-	}
-	
-	vsi = alloc_vma_sksm_info();
-        if(vsi)
-        {
-                ret = 1;
-                goto _out;
-        }
-        
-        vsi->vma = vma;
-        
-        // put the new vma to the red black tree.
-        rb_link_node(&vsi->tree_node, parent, new);
-        rb_insert_color(&vsi->tree_node, &vma_sksm_info_tree);
-       
-        // 并且放入零号vma链表尾
-        list_add_tail(&vsi->level_list, &vma_sksm_info_heads[0]);
-	
-	spin_unlock(&vma_sksm_info_lock);
-	
-        return 0;
-        
-_out:        
-        spin_unlock(&vma_sksm_info_lock);
-        return ret;
-}
-
-int register_vma_sksm(struct vm_area_struct *vma)
-{
-        if(unlikely(is_mergeable_area(vma)))
-        {
-               return __register_vma_sksm(vma); 
-        }
 	return 0;
 }
 
-int __unregister_vma_sksm(struct vm_area_struct *vma)
+int bitmap_read(struct bitmap *bm, unsigned index)
 {
-        struct rb_node **new = &vma_sksm_info_tree.rb_node;
-        struct rb_node *parent = NULL;
-        struct vma_sksm_info *vsi;
+	u8 val, needle;
+	unsigned int pos;
+	pos = ( index*2 + 7 ) / 8;
+printk(KERN_DEBUG"bitmap_read: %d\n", index);
+	if (pos >= bm->length)
+		return -1;
 
-        spin_lock(&vma_sksm_info_lock);
-        
-        while(*new)
-        {
-                vsi = rb_entry(*new, struct vma_sksm_info, tree_node);
-                parent = *new;
-                if(vma<vsi->vma)
-                {
-                       new = &parent->rb_left; 
-                }
-                else if(vma>vsi->vma)
-                {
-                       new = &parent->rb_right; 
-                }
-                else
-                {
-                        // found it~
-                        rb_erase(&vsi->tree_node, &vma_sksm_info_tree);
-                        free_vma_sksm_info(vsi);
-			spin_unlock(&vma_sksm_info_lock);
-
-                        return 0;
-                }
-        }
-        
-        spin_unlock(&vma_sksm_info_lock);
-        
-        return 1;
+	needle = index*2 % 8;	
+	val = bm->mem[pos];
+	val >>= needle;
+	val &= 0x03;
+printk(KERN_DEBUG"bitmap_read got %d\n", val);
+	return val;
 }
-
-int unregister_vma_sksm(struct vm_area_struct *vma)
-{
-        if(unlikely(is_mergeable_area(vma)))
-		return __unregister_vma_sksm(vma);
-	return 0;
-}
-
 
 //// for sys filesystem.
 #ifdef CONFIG_SYSFS
-#define SKSM_ATTR_RO(_name) static struct kobj_attribute _name##_attr = __ATTR_RO(_name)
-#define SKSM_ATTR(_name) static struct kobj_attribute _name##_attr = \
+#define KSM_ATTR_RO(_name) static struct kobj_attribute _name##_attr = __ATTR_RO(_name)
+#define KSM_ATTR(_name) static struct kobj_attribute _name##_attr = \
 		__ATTR(_name, 0644, _name##_show, _name##_store)
 
-static ssize_t sth_sksm_show(struct kobject *kobj,
+static struct bitmap *my_bitmap;
+static unsigned int my_index;
+static ssize_t sth_ksm_show(struct kobject *kobj,
 			     struct kobj_attribute *attr, char *buf)
 {
-    return sprintf(buf, "Hello, sksm. %u\n", vma_count);
+    return sprintf(buf, "Hello, XXXXXXXXXXX.");
 }
-SKSM_ATTR_RO(sth_sksm);
+static ssize_t sth_ksm_store(struct kobject *kobj,
+				struct kobj_attribute *attr, char *buf, size_t count)
+{
+	my_index = simple_strtol(buf, NULL, 10);
+	return count;
+}
+KSM_ATTR(sth_ksm);
 
 static ssize_t mytest_show(struct kobject *kobj,
 			struct kobj_attribute *attr, char *buf)
 {
-	int count;
-	struct vm_area_struct *vma;
-	struct mm_struct *mm;
-	struct pid *pid = find_get_pid(the_pid);
-	struct task_struct *task = pid_task(pid, PIDTYPE_PID);
-	put_pid(pid);
-
-	count = 0;
-	if(!task)
-	{
-		count = sprintf(buf, "Failed to get pid %d's task_t.\n",
-			the_pid);
-		return count;
-	}
-	count = sprintf(buf, "Get pid %d's task_t OKAY.\n", the_pid);
-	
-	/*Fix me, Race condition here.*/
-	mm = task->mm;
-	down_read(&mm->mmap_sem);
-	vma = mm->mmap;
-	while(vma)
-	{
-		if(is_mergeable_area(vma))
-			count += sprintf(buf+count, "%lx %lx\n", vma->vm_start,
-				vma->vm_end);
-		vma = vma->vm_next;
-	}
-	up_read(&mm->mmap_sem);
-
-	return count;
+	unsigned char ch = bitmap_read(my_bitmap, my_index);
+	return sprintf(buf, "%d\n", ch);
 }
 static ssize_t mytest_store(struct kobject *kobj,
 			struct kobj_attribute *attr, char *buf, size_t count)
 {
-	//char *ptr = buf + count -1;
-	the_pid = simple_strtol(buf, NULL, 10);
+	char *p;
+	unsigned int index = simple_strtol(buf, &p, 10);	
+	unsigned char ch = simple_strtol(++p, NULL, 10);
+	bitmap_write(my_bitmap, index, ch);
+	
 	return count;
-	//buf[count] = 0;
-	//printk(KERN_EMERG"%s ## %d\n", buf, count);
 }
-SKSM_ATTR(mytest);
+KSM_ATTR(mytest);
 
 static struct attribute *sksm_attrs[] = { 
-	&sth_sksm_attr, 
+	&sth_ksm_attr, 
 	&mytest_attr,
 	NULL 
 };
-static struct attribute_group sksm_attr_group = {
+static struct attribute_group ksm_attr_group = {
 	.attrs = sksm_attrs,
-	.name = "sksm", 
+	.name = "fable", 
 };
 
-static int __init sksm_init(void)
+static int __init ksm_init(void)
 {
-    int err;
-    vam_sksm_info_cache = SKSM_KMEM_CACHE(vma_sksm_info, 0);
-    if (!vam_sksm_info_cache) {
-	printk(KERN_DEBUG "SKSM: init sksm slab failed.\n");
-    }
-    err = init_vma_sksm_infos();
-    if (err) {
-	printk(KERN_DEBUG "SKSM: init_vma_sksm_infos failed. \n");
-    }
-    err = sysfs_create_group(mm_kobj, &sksm_attr_group);
-    if (err) {
-	printk(KERN_DEBUG "SKSM: register sysfs failed.\n");
-    }
-    printk("SKSM: [OKAY] calling SKSM_INIT.\n");
-    return 0;
+	int err;
+
+	bitmap_cache = KSM_KMEM_CACHE(bitmap, 0);
+	if (NULL == bitmap_cache){
+		printk(KERN_EMERG"Failed to create bitmap_cache.\n");
+		return 1;
+	}
+
+	err = sysfs_create_group(mm_kobj, &ksm_attr_group);
+	if (err) {
+		printk(KERN_EMERG"ksm: register sysfs failed.\n");
+		return 2;
+	}
+
+	my_bitmap = bitmap_create(25);
+	if (!my_bitmap){
+		printk(KERN_EMERG"ksm: bitmap_create failed.\n");
+	}
+
+	return 0;
 }
 
-static void __exit sksm_exit(void)
+static void __exit ksm_exit(void)
 {
-    sysfs_remove_group(mm_kobj, &sksm_attr_group);
-    kmem_cache_destroy(vam_sksm_info_cache);
-    printk(KERN_DEBUG "SKSM: Exit.");
+	bitmap_destroy(my_bitmap);
+	sysfs_remove_group(mm_kobj, &ksm_attr_group);
+	kmem_cache_destroy(bitmap_cache);
 } 
 
-module_init(sksm_init);
-module_exit(sksm_exit);
+module_init(ksm_init);
+module_exit(ksm_exit);
 #endif
+
