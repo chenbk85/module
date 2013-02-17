@@ -15,6 +15,8 @@
 #include <linux/wait.h>
 #include <linux/swap.h>
 #include <linux/pid.h>
+#include <linux/cryptohash.h>
+#include <crypto/hash.h>
 
 MODULE_LICENSE("GPL");
 
@@ -142,10 +144,96 @@ static struct attribute_group ksm_attr_group = {
 	.name = "fable", 
 };
 
+char* bins2hexs(const unsigned char* mem, int mem_len, char* buff, int buff_len)
+{
+	int len_expected, i;
+	char *buff_expected;
+	char small_buff[3];
+
+	if ( NULL == mem || 0 == mem_len || NULL == buff || 0 == buff_len ) 
+	{
+		if ( NULL != buff && 0 != buff_len )
+		{
+			memset(buff, 0, buff_len);
+			return buff;
+		}
+		else
+		{
+			return NULL;
+		}
+	}
+
+	memset(buff, 0, buff_len);
+
+	len_expected = mem_len * 2;
+	//char* buff_expected = new char[len_expected];
+	buff_expected = kmalloc(len_expected, GFP_KERNEL);
+	for ( i = 0; i < mem_len; i ++ )
+	{
+		int height = ( (mem[i] & 0xf0) >> 4);
+		int low = (mem[i] & 0x0f);
+
+		sprintf(small_buff, "%X", height);
+		sprintf(small_buff+1, "%X", low);
+		
+		memcpy(buff_expected + i * 2, small_buff, 2);
+	}
+	
+	if ( buff_len >= len_expected )
+	{
+		memcpy(buff, buff_expected, len_expected);
+	}
+
+	//delete []buff_expected;
+	kfree(buff_expected);
+
+	return buff;
+}
+
+int md5_hash(const char *mem, u32 len, u8 *hash)
+{
+	u32 size;
+	struct shash_desc *sdescmd5;
+	int err;
+
+        struct crypto_shash *md5 = crypto_alloc_shash("md5", 0, 0);
+      if (IS_ERR(md5)) 
+			return -1;
+      size = sizeof(struct shash_desc) + crypto_shash_descsize(md5);
+      sdescmd5 = kmalloc(size, GFP_KERNEL);
+      if (!sdescmd5) {
+              err = -1;
+              goto malloc_err;
+      }
+      sdescmd5->tfm = md5;
+      sdescmd5->flags = 0x0;
+
+      err = crypto_shash_init(sdescmd5);
+      if (err) {
+				err = -1;
+              goto hash_err;
+      }
+      crypto_shash_update(sdescmd5, mem, len);
+      err = crypto_shash_final(sdescmd5, hash);
+
+hash_err:
+      kfree(sdescmd5);
+malloc_err:
+      crypto_free_shash(md5);
+
+      return err;
+}
+
 static int __init ksm_init(void)
 {
 	int err;
-
+	char buf[512];
+	char buf2[512];
+	char* hello = "hello";
+	md5_hash(hello, 5, buf);
+	printk( "ksm_init: %s\n", bins2hexs(buf, 16, buf2, 512));
+	
+return 0;
 	bitmap_cache = KSM_KMEM_CACHE(bitmap, 0);
 	if (NULL == bitmap_cache){
 		printk(KERN_EMERG"Failed to create bitmap_cache.\n");
@@ -167,7 +255,7 @@ static int __init ksm_init(void)
 }
 
 static void __exit ksm_exit(void)
-{
+{return;
 	bitmap_destroy(my_bitmap);
 	sysfs_remove_group(mm_kobj, &ksm_attr_group);
 	kmem_cache_destroy(bitmap_cache);
