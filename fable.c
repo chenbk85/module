@@ -224,17 +224,61 @@ malloc_err:
       return err;
 }
 
+/*static int is_zero_cleared_page(struct page *page)
+{
+	unsigned char same;
+	void *addr;
+	int len;
+
+	len /= 4;
+	same = 0;
+
+	addr = kmap_atomic(page);
+
+	__asm__ __volatile__
+	(
+	 "repe; scasl;"
+	 "sete %0"
+	 : "=qm"(same)
+	 : "a"(0), "D"(addr), "c"(len)
+	 : "cc");
+
+	kunmap_atomic(addr);
+
+	return same;
+}*/
+
+static int is_zero_cleared_page(struct page *page)
+{
+	int ret, i, zero_page;
+	unsigned long *addr;
+
+	zero_page = 1;
+	addr = kmap_atomic(page);
+	for (i = 0; i < 512; i++)
+	{
+		if (addr[i]) {
+			zero_page = 0;
+			break;
+		}
+	}
+	kunmap_atomic(addr);
+
+	return zero_page;
+}
+
 static int __init ksm_init(void)
 {
-	int err;
-	char buf[512];
-	char buf2[512];
-	char* hello = "hello";
-	md5_hash(hello, 5, buf);
-	printk( "ksm_init: %s\n", bins2hexs(buf, 16, buf2, 512));
-	
+	void *addr;
+	struct page *page = alloc_page(GFP_KERNEL|__GFP_ZERO);	
+	addr = page_address(page);
+	if (is_zero_cleared_page(page))	
+		printk(KERN_DEBUG"zero.\n");
+	else
+		printk(KERN_DEBUG"not zero.\n");
+
 return 0;
-	bitmap_cache = KSM_KMEM_CACHE(bitmap, 0);
+	/*bitmap_cache = KSM_KMEM_CACHE(bitmap, 0);
 	if (NULL == bitmap_cache){
 		printk(KERN_EMERG"Failed to create bitmap_cache.\n");
 		return 1;
@@ -250,7 +294,7 @@ return 0;
 	if (!my_bitmap){
 		printk(KERN_EMERG"ksm: bitmap_create failed.\n");
 	}
-
+*/
 	return 0;
 }
 
